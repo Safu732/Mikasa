@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+MIKASA OS - DAY 8: LINUX RESOURCE MANAGEMENT & SRE BOOTCAMP
+Single file, zero dependencies, Termux ready.
+"""
+
+import os
+import sys
+import json
+import time
+import random
+from datetime import datetime
+
+# ========== COLORS (no rich needed) ==========
+class C:
+    CYAN = "[96m"
+    GREEN = "[92m"
+    YELLOW = "[93m"
+    RED = "[91m"
+    MAGENTA = "[95m"
+    BOLD = "[1m"
+    DIM = "[2m"
+    END = "[0m"
+
+def printc(text, color=""):
+    print(f"{color}{text}{C.END}")
+
+# ========== DATA ==========
+INCIDENTS = [
+    {
+        "id": "INC-D8-001",
+        "title": "CPU 100% - Runaway Python Process",
+        "severity": "CRITICAL",
+        "desc": "A Python process is consuming 100% CPU. System sluggish. You must throttle it without killing it.",
+        "symptoms": ["load average > 4.0", "top shows Python at 99.9% CPU", "Other cron jobs delayed"],
+        "root_causes": ["No CPU throttling (nice=0)", "No cgroup limits", "Cron job has no resource constraints"],
+        "expected": ["ps -eo pid,comm,nice,pcpu --sort=-pcpu", "renice +10 -p <PID>", "cpulimit -p <PID> -l 50"],
+        "hints": ["renice changes RUNNING processes", "cpulimit sends SIGSTOP/SIGCONT", "nice only affects NEW processes"],
+    },
+    {
+        "id": "INC-D8-002",
+        "title": "Too Many Open Files - FD Leak",
+        "severity": "HIGH",
+        "desc": "Service crashing with 'Too many open files'. lsof shows thousands of entries. Fix without restart if possible.",
+        "symptoms": ["OSError: Too many open files", "lsof -p <PID> shows thousands", "ulimit -n shows 1024"],
+        "root_causes": ["FDs not closed after uploads", "Default ulimit too low", "No connection pooling"],
+        "expected": ["ulimit -n", "lsof -p <PID> | wc -l", "ls -la /proc/<PID>/fd/", "cat /proc/<PID>/limits"],
+        "hints": ["Check /proc/<PID>/fd/ for WHAT is open", "Soft limit can be raised by process", "Hard limit requires root"],
+    },
+    {
+        "id": "INC-D8-003",
+        "title": "RAM Exhaustion - OOM Killer",
+        "severity": "CRITICAL",
+        "desc": "OOM killer killing processes. Python leaking memory. No swap on Android. Identify and contain.",
+        "symptoms": ["dmesg shows OOM kill", "free -h near zero", "Python RSS growing steadily", "No swap configured"],
+        "root_causes": ["Unbounded list growth", "No ulimit -v set", "No cgroup memory limits", "No OOM protection"],
+        "expected": ["ps aux --sort=-%mem", "watch -n 5 'ps -o pid,rss,vsz -p <PID>'", "pmap -x <PID>", "ulimit -v 2097152"],
+        "hints": ["RSS = actual RAM, VSZ = virtual", "pmap shows per-mapping memory", "oom_score_adj = -1000 = never kill"],
+    },
+    {
+        "id": "INC-D8-004",
+        "title": "Cron Silent Backup Death",
+        "severity": "MEDIUM",
+        "desc": "Nightly backup failing silently for 3 days. No logs. Manual run works. Find why.",
+        "symptoms": ["Backup files 3 days old", "crontab -l shows job", "No error output", "Manual execution works"],
+        "root_causes": ["Cron PATH too minimal", "No MAILTO or logging", "Script lacks set -e", "Missing env vars"],
+        "expected": ["crontab -l", "env -i /bin/sh -c 'echo $PATH'", "chmod +x backup.sh && ./backup.sh 2>&1"],
+        "hints": ["Cron PATH is /usr/bin:/bin only", "Use absolute paths in cron", "Add set -euo pipefail to scripts"],
+    },
+    {
+        "id": "INC-D8-005",
+        "title": "Segfault on Startup",
+        "severity": "HIGH",
+        "desc": "MIKASA OS crashes on startup with segfault. No Python traceback. Native library issue.",
+        "symptoms": ["Segmentation fault on start", "No Python traceback", "dmesg shows fault address", "Recent update suspected"],
+        "root_causes": ["ABI mismatch in C extension", "Missing shared library", "Memory corruption", "Incompatible versions"],
+        "expected": ["dmesg | tail -30", "strace -f python app.py 2>&1 | tail -50", "ldd $(which python)", "pip list --outdated"],
+        "hints": ["strace shows last syscall before crash", "ldd 'not found' = missing lib", "PYTHONVERBOSE=1 for module loading"],
+    },
+]
+
+QUESTIONS = [
+    {
+        "q": "Explain the difference between nice and renice. When would you use each? Can a regular user increase priority?",
+        "cat": "Linux",
+        "diff": "Senior",
+        "keywords": ["new process", "running process", "root", "increase", "decrease", "priority"],
+        "followup": "What if renice -20 still hogs CPU? Next tool?",
+        "mistakes": ["Thinking nice works on running processes", "Not knowing only root can increase priority"],
+        "answer": "nice sets NEW process priority (-20 to 19). renice changes RUNNING process. Any user can LOWER priority (increase nice). Only root can INCREASE priority (decrease nice). If renice -20 is not enough, use cpulimit (hard cap) or cgroups v2 cpu.max.",
+    },
+    {
+        "q": "What is the difference between soft limit and hard limit in ulimit? Which one can a process change itself?",
+        "cat": "Linux",
+        "diff": "Mid",
+        "keywords": ["soft", "hard", "root", "ceiling", "raise", "lower"],
+        "followup": "How would you set a permanent ulimit for a systemd service?",
+        "mistakes": ["Confusing soft and hard limits", "Thinking both require root"],
+        "answer": "Soft limit: what process is constrained to. Can be raised up to hard limit. Hard limit: absolute ceiling. Only root can raise it. For systemd: LimitNOFILE=65536:1048576 in [Service] section.",
+    },
+    {
+        "q": "A cron job works when run manually but fails in cron. List 5 reasons why.",
+        "cat": "Linux",
+        "diff": "Senior",
+        "keywords": ["PATH", "environment", "shell", "tty", "working directory", "permissions", "locale"],
+        "followup": "How do you debug a cron job without waiting for the next minute?",
+        "mistakes": ["Only mentioning PATH", "Not considering working directory"],
+        "answer": "1. PATH: Cron uses /usr/bin:/bin. 2. Working directory: Cron runs from $HOME. 3. Environment variables: Missing LANG or custom vars. 4. TTY: Cron has no TTY, stdin reads hang. 5. Shell: Cron uses /bin/sh, not bash. Debug: env -i /bin/sh -c /path/to/script",
+    },
+    {
+        "q": "Explain the difference between SIGTERM, SIGKILL, SIGSTOP, and SIGCONT. When is SIGKILL the wrong choice?",
+        "cat": "Linux",
+        "diff": "Mid",
+        "keywords": ["graceful", "cleanup", "flush", "cannot handle", "stop", "continue", "database", "corruption"],
+        "followup": "What signal does systemd send by default during service stop? How long does it wait?",
+        "mistakes": ["Using SIGKILL as first resort", "Not understanding SIGSTOP vs SIGKILL"],
+        "answer": "SIGTERM(15): Request terminate, process can catch and cleanup. SIGKILL(9): Force kill, NO cleanup possible. SIGSTOP(19): Pause process, cannot catch. SIGCONT(18): Resume stopped. SIGKILL is wrong when: database locks held (corruption), unflushed writes (data loss), parent of critical children (orphan risk). Systemd: SIGTERM, waits 90s (TimeoutStopSec), then SIGKILL.",
+    },
+    {
+        "q": "What is /proc and why is it critical for debugging? Give 3 specific files you would check during an incident.",
+        "cat": "Linux",
+        "diff": "Senior",
+        "keywords": ["pseudo-filesystem", "kernel", "runtime", "pid", "fd", "status", "limits", "maps"],
+        "followup": "What is the difference between /proc/<pid>/maps and /proc/<pid>/smaps?",
+        "mistakes": ["Treating /proc as regular files", "Not knowing it is kernel-generated"],
+        "answer": "/proc is a pseudo-filesystem exposing kernel data structures as files. Generated on read, not stored on disk. Critical files: 1. /proc/<pid>/status - state, VmRSS, threads. 2. /proc/<pid>/fd/ - all open FDs. 3. /proc/<pid>/limits - current resource limits. maps = quick overview per region. smaps = full details with PSS per region.",
+    },
+    {
+        "q": "Design a log rotation strategy for MIKASA OS that prevents disk full incidents.",
+        "cat": "Automation",
+        "diff": "Senior",
+        "keywords": ["logrotate", "size", "compress", "delaycompress", "missingok", "copytruncate"],
+        "followup": "What happens if logrotate runs while the app has the log file open?",
+        "mistakes": ["Not mentioning copytruncate or create", "Ignoring compression"],
+        "answer": "logrotate config: daily, missingok, rotate 14, compress, delaycompress, notifempty, create 0644, size 100M, postrotate to signal app. delaycompress: do not compress yesterday's log (still being read). copytruncate: copy then truncate (no restart needed). Alternative: systemd-journald with RuntimeMaxUse=500M.",
+    },
+    {
+        "q": "A process has 1000 threads. Is this a problem? How would you investigate thread leaks in Python?",
+        "cat": "Debugging",
+        "diff": "Staff",
+        "keywords": ["context switching", "GIL", "threading", "concurrent.futures", "asyncio", "pool"],
+        "followup": "What is the difference between a thread leak and a memory leak in terms of symptoms?",
+        "mistakes": ["Thinking more threads = faster", "Not mentioning GIL"],
+        "answer": "1000 threads IS a problem: context switching overhead dominates, each thread consumes ~8MB stack, Python GIL limits true parallelism. Investigation: ps -eLf | grep <PID> | wc -l, /proc/<pid>/task/, threading.enumerate(), use ThreadPoolExecutor with max_workers. Thread leak: high thread count, high context switches. Memory leak: growing RSS/VSZ, fewer threads consuming more.",
+    },
+    {
+        "q": "Explain cgroups v2 vs v1 for resource management. Why should MIKASA OS migrate to cgroups v2?",
+        "cat": "Architecture",
+        "diff": "Staff",
+        "keywords": ["unified hierarchy", "delegation", "memory.max", "cpu.max", "pids.max", "systemd"],
+        "followup": "How would you set a 500MB memory limit and 50% CPU limit using cgroups v2?",
+        "mistakes": ["Not knowing v2 is unified", "Confusing v1 controllers"],
+        "answer": "cgroups v1: separate hierarchies per controller (cpu, memory, blkio), complex, race-prone. cgroups v2: single unified hierarchy, all controllers in one tree, better systemd integration, rootless container support. Example: mkdir /sys/fs/cgroup/mikasa; echo 500000000 > memory.max; echo '50000 100000' > cpu.max; echo $$ > cgroup.procs.",
+    },
+]
+
+# ========== SCORING ==========
+class Scores:
+    def __init__(self):
+        self.linux = 0
+        self.engineering = 0
+        self.debugging = 0
+        self.automation = 0
+        self.interview = 0
+        self.commands = 0
+        self.questions = 0
+        self.incidents = 0
+        self.start = datetime.now().isoformat()
+        self.cmd_scores = []
+        self.q_scores = []
+
+    def overall(self):
+        return int((self.linux + self.engineering + self.debugging + self.automation + self.interview) / 5)
+
+    def add_cmd(self, score, category):
+        self.commands += 1
+        self.cmd_scores.append((score, category))
+        # Update relevant category
+        if category in ["Linux", "Process"]:
+            self.linux = int((self.linux * (len(self.cmd_scores)-1) + score) / len(self.cmd_scores))
+        elif category in ["Debugging"]:
+            self.debugging = int((self.debugging * (len(self.cmd_scores)-1) + score) / len(self.cmd_scores))
+        elif category in ["Automation"]:
+            self.automation = int((self.automation * (len(self.cmd_scores)-1) + score) / len(self.cmd_scores))
+        else:
+            self.engineering = int((self.engineering * (len(self.cmd_scores)-1) + score) / len(self.cmd_scores))
+
+    def add_q(self, score):
+        self.questions += 1
+        self.q_scores.append(score)
+        self.interview = int((self.interview * (len(self.q_scores)-1) + score) / len(self.q_scores))
+
+    def add_incident(self, resolved, bonus):
+        if resolved:
+            self.incidents += 1
+            self.debugging = min(100, self.debugging + bonus)
+            self.linux = min(100, self.linux + bonus // 2)
+
+# ========== REVIEW ENGINE ==========
+GOOD_PATTERNS = {
+    "renice": (20, "Excellent: Using renice to throttle running processes. Real SRE skill."),
+    "nice -n": (15, "Good: Setting process priority at launch. Proactive resource management."),
+    "cpulimit": (20, "Excellent: cpulimit is the hard cap when nice is not enough."),
+    "ulimit -n": (20, "Excellent: Raising file descriptor limits. Common production bottleneck."),
+    "ulimit -v": (15, "Good: Setting virtual memory limits. Prevents OOM."),
+    "lsof -p": (15, "Excellent: lsof for per-process FD inspection. Critical for FD leaks."),
+    "/proc/": (20, "Excellent: Direct /proc inspection. Deepest level of debugging."),
+    "pmap -x": (15, "Excellent: pmap -x shows per-mapping RSS. Essential for memory leaks."),
+    "strace": (20, "Excellent: strace for syscall-level debugging. Deep systems knowledge."),
+    "watch -n": (10, "Good: Using watch for periodic monitoring. Cleaner than while loops."),
+    "crontab": (10, "Good: Managing cron jobs. Essential automation skill."),
+    "set -e": (20, "Excellent: Bash strict mode. Fail-fast, production-grade."),
+    "ionice": (15, "Excellent: ionice for I/O scheduling. Often forgotten."),
+    "ps --sort=-%mem": (15, "Excellent: Sorting by memory. Senior-level triage."),
+    "ps --sort=-%cpu": (15, "Excellent: Sorting by CPU. Senior-level triage."),
+    "df -i": (20, "Excellent: Checking inode usage. Separates juniors from seniors."),
+    "ss -tlnp": (15, "Excellent: ss is faster than netstat, -p shows PIDs."),
+}
+
+BAD_PATTERNS = {
+    "kill -9": (-20, "SIGKILL is a last resort. Try SIGTERM (-15) first. SIGKILL prevents cleanup."),
+    "chmod 777": (-25, "chmod 777 violates least privilege. Use 755 for dirs, 644 for files."),
+    "cat | grep": (-15, "Useless use of cat. grep can read files directly."),
+    "rm -rf /": (-100, "DANGER: This will destroy your system. Never run this."),
+    "sudo ": (-5, "Avoid sudo in Termux unless absolutely necessary."),
+    "for i in `ls": (-15, "Do not parse ls output. Use for f in /path/* or find."),
+}
+
+def review_command(cmd):
+    score = 50
+    feedback = []
+    category = "General"
+
+    # Detect category
+    base = cmd.split()[0] if cmd.split() else ""
+    if base in ["nice", "renice", "cpulimit", "ionice", "chrt", "ulimit", "taskset"]:
+        category = "Linux"
+    elif base in ["ps", "top", "pmap", "free"]:
+        category = "Process"
+    elif base in ["lsof", "strace", "dmesg"]:
+        category = "Debugging"
+    elif base in ["cron", "crontab", "logrotate"]:
+        category = "Automation"
+
+    # Check patterns
+    for pattern, (delta, msg) in GOOD_PATTERNS.items():
+        if pattern in cmd:
+            score += delta
+            feedback.append(f"[GOOD] {msg}")
+
+    for pattern, (delta, msg) in BAD_PATTERNS.items():
+        if pattern in cmd:
+            score += delta
+            feedback.append(f"[BAD] {msg}")
+
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        verdict = "SENIOR-LEVEL"
+    elif score >= 60:
+        verdict = "ACCEPTABLE"
+    elif score >= 40:
+        verdict = "NEEDS IMPROVEMENT"
+    else:
+        verdict = "JUNIOR MISTAKE"
+
+    return score, verdict, category, " | ".join(feedback) if feedback else "No specific feedback."
+
+# ========== INTERVIEW ENGINE ==========
+def evaluate_answer(question, user_answer):
+    user_lower = user_answer.lower()
+    score = 30
+    feedback = []
+
+    matched = [kw for kw in question["keywords"] if kw.lower() in user_lower]
+    score += len(matched) * 10
+    if matched:
+        feedback.append(f"Good keywords: {', '.join(matched)}")
+
+    depth = ["because", "therefore", "however", "for example", "specifically", "furthermore"]
+    depth_count = sum(1 for d in depth if d in user_lower)
+    score += depth_count * 5
+    if depth_count >= 2:
+        feedback.append("Strong explanatory depth")
+
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        grade = "STAFF-LEVEL"
+    elif score >= 60:
+        grade = "SENIOR-LEVEL"
+    elif score >= 40:
+        grade = "ACCEPTABLE"
+    else:
+        grade = "NEEDS STUDY"
+
+    return score, f"[{grade}] " + " | ".join(feedback)
+
+# ========== UI ==========
+def banner():
+    print()
+    printc("=" * 60, C.CYAN)
+    printc("  MIKASA OS v4.1.0 - DAY 8", C.BOLD + C.CYAN)
+    printc("  LINUX RESOURCE MANAGEMENT & SRE BOOTCAMP", C.CYAN)
+    printc("=" * 60, C.CYAN)
+    print()
+
+def show_menu():
+    print("1. Start Incident Simulation")
+    print("2. Review My Command")
+    print("3. Interview Question")
+    print("4. View Current Scores")
+    print("5. Linux Cheatsheet")
+    print("6. End Session & Generate Report")
+    print()
+
+def show_scores(scores):
+    print()
+    printc("SESSION SCORES", C.BOLD + C.CYAN)
+    print(f"  Linux:       {scores.linux:>3}/100  {'█' * (scores.linux // 5)}{'░' * (20 - scores.linux // 5)}")
+    print(f"  Engineering: {scores.engineering:>3}/100  {'█' * (scores.engineering // 5)}{'░' * (20 - scores.engineering // 5)}")
+    print(f"  Debugging:   {scores.debugging:>3}/100  {'█' * (scores.debugging // 5)}{'░' * (20 - scores.debugging // 5)}")
+    print(f"  Automation:  {scores.automation:>3}/100  {'█' * (scores.automation // 5)}{'░' * (20 - scores.automation // 5)}")
+    print(f"  Interview:   {scores.interview:>3}/100  {'█' * (scores.interview // 5)}{'░' * (20 - scores.interview // 5)}")
+    print(f"  OVERALL:     {scores.overall():>3}/100  {'█' * (scores.overall() // 5)}{'░' * (20 - scores.overall() // 5)}")
+    print()
+
+def show_cheatsheet():
+    print()
+    printc("LINUX RESOURCE MANAGEMENT CHEATSHEET", C.BOLD + C.CYAN)
+    print("""
+PROCESS PRIORITY (nice / renice)
+  nice -n 10 ./script.sh          # Launch with low priority
+  renice +10 -p <PID>             # Lower priority of running process
+  renice -5 -p <PID>              # Raise priority (requires root)
+  ps -eo pid,comm,nice,pcpu       # Show nice values
+  chrt -p <PID>                   # Show real-time scheduling
+  ionice -c 2 -n 4 -p <PID>       # Set I/O priority
+
+CPU THROTTLING
+  cpulimit -p <PID> -l 50         # Hard cap at 50% CPU
+  taskset -c 0,1 <cmd>            # Pin to specific CPUs
+
+RESOURCE LIMITS (ulimit)
+  ulimit -a                       # Show all limits
+  ulimit -n 65536                 # Max open files (soft)
+  ulimit -Sn 4096                 # Set soft limit
+  ulimit -Hn 65536                # Set hard limit
+  ulimit -v 2097152               # Max virtual memory (2GB)
+  ulimit -u 1024                  # Max user processes
+
+MEMORY DEBUGGING
+  free -h                         # System memory
+  ps aux --sort=-%mem | head      # Top memory consumers
+  pmap -x <PID>                   # Detailed memory map
+  cat /proc/<PID>/status | grep Vm
+  cat /proc/<PID>/smaps           # Per-mapping details
+
+FILE DESCRIPTOR DEBUGGING
+  lsof -p <PID>                   # All open files
+  ls -la /proc/<PID>/fd/          # Raw FD symlinks
+  cat /proc/<PID>/limits          # Resource limits
+
+CRON & AUTOMATION
+  crontab -l                      # List cron jobs
+  crontab -e                      # Edit cron jobs
+  env -i /bin/sh -c 'cmd'         # Simulate cron env
+
+BASH STRICT MODE
+  set -euo pipefail
+  # -e: exit on error
+  # -u: fail on undefined variables
+  # -o pipefail: pipeline fails if ANY command fails
+
+CGROUPS V2
+  mkdir /sys/fs/cgroup/mikasa
+  echo 500000000 > /sys/fs/cgroup/mikasa/memory.max
+  echo "50000 100000" > /sys/fs/cgroup/mikasa/cpu.max
+  echo $$ > /sys/fs/cgroup/mikasa/cgroup.procs
+""")
+
+def run_incident(incident, scores):
+    print()
+    printc(f"INCIDENT: {incident['id']}", C.BOLD + C.RED)
+    printc(f"Title: {incident['title']}", C.YELLOW)
+    printc(f"Severity: {incident['severity']}", C.RED)
+    print(f"Description: {incident['desc']}")
+    print()
+    print("Symptoms:")
+    for s in incident["symptoms"]:
+        print(f"  - {s}")
+    print()
+    print(f"Time Limit: 15 minutes")
+    print("Commands: 'done' = resolved, 'hint' = help, 'giveup' = solution, 'postmortem' = template")
+    print()
+
+    start = time.time()
+    while True:
+        cmd = input("> shell: ").strip()
+        if cmd.lower() == "done":
+            elapsed = time.time() - start
+            found = input("Did you identify the root cause? (yes/no): ").lower().startswith("y")
+            resolved = elapsed < 900 and found
+            bonus = max(0, int((900 - elapsed) / 900 * 20))
+            scores.add_incident(resolved, bonus)
+            if resolved:
+                printc("Incident RESOLVED. Good work, SRE.", C.GREEN)
+            else:
+                printc("Incident NOT fully resolved.", C.YELLOW)
+                print("Root causes:")
+                for rc in incident["root_causes"]:
+                    print(f"  - {rc}")
+            break
+        elif cmd.lower() == "hint":
+            printc(f"HINT: {random.choice(incident['hints'])}", C.YELLOW)
+        elif cmd.lower() == "giveup":
+            printc("SOLUTION:", C.RED)
+            for rc in incident["root_causes"]:
+                print(f"  - {rc}")
+            print("Expected commands:")
+            for ec in incident["expected"]:
+                print(f"  $ {ec}")
+            break
+        elif cmd.lower() == "postmortem":
+            print()
+            print("POST-MORTEM TEMPLATE:")
+            print(f"Incident: {incident['id']} - {incident['title']}")
+            print("Root Cause: [Your analysis]")
+            print("Fix Applied: [Your commands]")
+            print("Lessons Learned: [What you learned]")
+            print("Action Items: [What to prevent recurrence]")
+        elif cmd:
+            score, verdict, category, feedback = review_command(cmd)
+            scores.add_cmd(score, category)
+            print()
+            printc(f"Command: {cmd}", C.CYAN)
+            printc(f"Score: {score}/100 | Verdict: {verdict} | Category: {category}", C.BOLD)
+            print(f"Feedback: {feedback}")
+            print()
+
+def run_interview(scores):
+    q = random.choice(QUESTIONS)
+    print()
+    printc(f"INTERVIEW QUESTION [{q['diff']}] [{q['cat']}]", C.BOLD + C.MAGENTA)
+    print(q["q"])
+    print(f"Follow-up: {q['followup']}")
+    print()
+    print("Type your answer (empty line to submit):")
+    lines = []
+    while True:
+        line = input()
+        if line == "" and lines:
+            break
+        lines.append(line)
+    answer = "\n".join(lines)
+    score, feedback = evaluate_answer(q, answer)
+    scores.add_q(score)
+    print()
+    printc(f"Score: {score}/100", C.BOLD)
+    print(feedback)
+    print()
+    printc("MODEL ANSWER:", C.GREEN)
+    print(q["answer"])
+    print()
+
+def generate_report(scores):
+    scores.end = datetime.now().isoformat()
+    print()
+    printc("=" * 60, C.CYAN)
+    printc("DAY 8 SESSION REPORT", C.BOLD + C.CYAN)
+    printc("=" * 60, C.CYAN)
+    show_scores(scores)
+    print(f"Commands Reviewed: {scores.commands}")
+    print(f"Questions Answered: {scores.questions}")
+    print(f"Incidents Resolved: {scores.incidents}")
+    print()
+    printc("INTERVIEWER NOTES", C.BOLD)
+    if scores.linux >= 75:
+        print("Strong Linux internals knowledge.")
+    else:
+        print("Linux resource management needs reinforcement.")
+    if scores.debugging >= 75:
+        print("Excellent debugging intuition.")
+    else:
+        print("Debugging approach is reactive. Practice 5 Whys.")
+    if scores.automation >= 70:
+        print("Good automation mindset.")
+    else:
+        print("Automation skills need development.")
+    if scores.interview >= 70:
+        print("Interview answers show depth.")
+    else:
+        print("Interview answers lack depth. Explain trade-offs.")
+    print()
+    printc("DAY 9 ROADMAP", C.BOLD + C.YELLOW)
+    if scores.linux < 70:
+        print("- Linux Mastery: cgroups v2, namespaces, capabilities")
+    if scores.debugging < 70:
+        print("- Debugging Mastery: eBPF, bpftrace, kernel probes")
+    if scores.automation < 70:
+        print("- Automation Deep Dive: systemd timers, Ansible")
+    if scores.engineering < 70:
+        print("- System Design: Distributed systems, SRE practices")
+    if scores.overall() >= 80:
+        print("- Advanced: Kubernetes internals, eBPF programming")
+        print("- Leadership: Write SRE runbooks, mentor juniors")
+    print()
+    printc("REAL INTERVIEW QUESTION", C.BOLD + C.RED)
+    print(random.choice([
+        "Design a zero-downtime deployment for MIKASA OS across 500 Android devices.",
+        "A Python service leaks 1MB/hour. You cannot restart for 30 days. How do you find and mitigate?",
+        "Explain the full journey of a TCP packet from Termux to Ollama server. Every layer.",
+        "Design monitoring for 10,000 Termux instances. What database? What transport?",
+        "You have 24 hours to make MIKASA OS production-grade. What do you prioritize?",
+    ]))
+    print()
+    # Save report
+    report = f"""MIKASA OS DAY 8 REPORT
+Linux: {scores.linux}/100
+Engineering: {scores.engineering}/100
+Debugging: {scores.debugging}/100
+Automation: {scores.automation}/100
+Interview: {scores.interview}/100
+Overall: {scores.overall()}/100
+Commands: {scores.commands}
+Questions: {scores.questions}
+Incidents: {scores.incidents}
+"""
+    os.makedirs("reports", exist_ok=True)
+    fname = f"reports/day8_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(fname, "w") as f:
+        f.write(report)
+    printc(f"Report saved to: {fname}", C.GREEN)
+
+# ========== MAIN ==========
+def main():
+    banner()
+    scores = Scores()
+
+    while True:
+        show_menu()
+        choice = input("> Select: ").strip()
+
+        if choice == "1":
+            print()
+            for i, inc in enumerate(INCIDENTS, 1):
+                print(f"[{i}] [{inc['severity']}] {inc['title']}")
+            idx = int(input("> Select incident: ")) - 1
+            if 0 <= idx < len(INCIDENTS):
+                run_incident(INCIDENTS[idx], scores)
+        elif choice == "2":
+            print()
+            cmd = input("> Enter command: ").strip()
+            if cmd:
+                score, verdict, category, feedback = review_command(cmd)
+                scores.add_cmd(score, category)
+                print()
+                printc(f"Score: {score}/100 | {verdict}", C.BOLD)
+                print(f"Feedback: {feedback}")
+        elif choice == "3":
+            run_interview(scores)
+        elif choice == "4":
+            show_scores(scores)
+        elif choice == "5":
+            show_cheatsheet()
+        elif choice in ("6", "exit", "quit"):
+            generate_report(scores)
+            printc("Goodbye, pilot. See you on Day 9.", C.CYAN)
+            break
+        else:
+            printc("Invalid choice. Use 1-6.", C.RED)
+
+if __name__ == "__main__":
+    main()

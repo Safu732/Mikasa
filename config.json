@@ -1,0 +1,11 @@
+{
+    "profile": {
+        "username": "Fasi",
+        "role": "Root Architect",
+        "clearance": "Level-5"
+    },
+    "ui": {
+        "theme": "matrix_neon",
+        "animations": true
+    }
+}
